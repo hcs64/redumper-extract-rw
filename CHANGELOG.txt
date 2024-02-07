@@ -1,0 +1,1 @@
+0.1 - attempt to detect bad packets by checking pairtyP against the most common values
