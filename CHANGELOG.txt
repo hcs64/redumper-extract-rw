@@ -1,2 +1,3 @@
 0.1 - attempt to detect bad packets by checking pairtyP against the most common values
-0.2 - correct R-W
+0.2 - correct R-W with P and Q parity
+0.3 - fix reversed P and Q names, only attempt to correct P parity
