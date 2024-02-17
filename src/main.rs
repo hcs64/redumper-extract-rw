@@ -8,10 +8,10 @@ use gf256::{gf, rs::rs};
 #[gf(polynomial = 0x43, generator = 0x2)]
 type gf64;
 
-#[rs(gf=gf64, u=u8, block=4, data=2)]
+#[rs(gf=gf64, u=u8, block=24, data=20)]
 mod p_parity {}
 
-#[rs(gf=gf64, u=u8, block=24, data=20)]
+#[rs(gf=gf64, u=u8, block=4, data=2)]
 mod q_parity {}
 
 // deinterleave offsets, from karaoke-dx by way of cdgparse
@@ -51,9 +51,9 @@ fn main() {
     let mut outfile = BufWriter::new(File::create(&args[2]).expect("open output"));
 
     let mut pack_count = 0;
-    let mut uncorrected_count = 0;
     let mut p_corrected = 0;
-    let mut q_corrected = 0;
+    let mut p_uncorrected = 0;
+    let mut q_error_count = 0;
 
     let mut zero_count = 0;
     let mut graphics_count = 0;
@@ -66,36 +66,38 @@ fn main() {
         );
 
         for (pack_i, pack) in packet.chunks_mut(PACK_SIZE).enumerate() {
-            let mut ok = true;
             pack_count += 1;
 
-            // FIXME I don't know whether correcting P or Q first is better
-            if !p_parity::is_correct(&pack[0..4]) {
-                if let Ok(_corrected_errors) = p_parity::correct_errors(&mut pack[0..4]) {
+            if !p_parity::is_correct(pack) {
+                if let Ok(_correct_errors) = p_parity::correct_errors(pack) {
                     p_corrected += 1;
-                }
-            }
-
-            if !q_parity::is_correct(&pack[0..24]) {
-                if let Ok(_correct_errors) = q_parity::correct_errors(&mut pack[0..24]) {
-                    q_corrected += 1;
                 } else {
-                    uncorrected_count += 1;
-                    ok = false;
+                    p_uncorrected += 1;
+
+                    let mut expected = pack.to_owned();
+                    p_parity::encode(&mut expected);
                     eprintln!(
-                        "{time}: uncorrected {relative_sector:6}.{pack_i}: tc {tc:04x}",
+                        "{time}: P uncorrected {relative_sector:6}.{pack_i}",
                         time = format_time(relative_sector),
-                        tc = u16::from_be_bytes(pack[0..2].try_into().unwrap()),
                     );
                 }
             }
 
-            if ok {
-                match pack[0] >> 3 {
-                    0 => zero_count += 1,
-                    1 => graphics_count += 1,
-                    _ => other_count += 1,
-                }
+            // FIXME: I don't know if it's worth trying to fix Q, and if
+            // so whether to attempt it before P, or maybe only if P fails.
+            if !q_parity::is_correct(&pack[0..4]) {
+                q_error_count += 1;
+                eprintln!(
+                    "{time}: Q error {relative_sector:6}.{pack_i}: {tc:08x}",
+                    time = format_time(relative_sector),
+                    tc = u32::from_be_bytes(pack[0..4].try_into().unwrap()),
+                );
+            }
+
+            match pack[0] >> 3 {
+                0 => zero_count += 1,
+                1 => graphics_count += 1,
+                _ => other_count += 1,
             }
 
             outfile.write_all(pack).expect("write output");
@@ -103,9 +105,8 @@ fn main() {
     }
 
     eprintln!("{pack_count:8} packs");
-    eprintln!("{p_corrected:8} P corrected");
-    eprintln!("{q_corrected:8} Q corrected");
-    eprintln!("{uncorrected_count:8} uncorrected");
+    eprintln!("P errors: {p_corrected:8} corrected / {p_uncorrected} uncorrected");
+    eprintln!("Q errors: {q_error_count:8}");
     eprintln!();
     eprintln!("{zero_count:8} zero");
     eprintln!("{graphics_count:8} graphics");
