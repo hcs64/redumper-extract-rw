@@ -44,20 +44,59 @@ fn format_time(sector: usize) -> String {
     format!("{minutes:02}:{seconds:02}.{frames:02}")
 }
 
+struct PackCount {
+    total: usize,
+    p_corrected: usize,
+    p_uncorrected: usize,
+    q_error: usize,
+    name: String,
+}
+
+impl PackCount {
+    fn new(name: &str) -> Self {
+        Self {
+            total: 0,
+            p_corrected: 0,
+            p_uncorrected: 0,
+            q_error: 0,
+            name: name.to_owned(),
+        }
+    }
+
+    fn report(&self) {
+        if self.total == 0 {
+            return;
+        }
+        eprintln!("{} packs:", self.name);
+        eprintln!("  total: {:8}", self.total);
+        if self.p_uncorrected > 0 {
+            eprintln!(
+                "  P errors: {:8} corrected / {} uncorrected",
+                self.p_corrected, self.p_uncorrected
+            );
+        } else {
+            eprintln!("  P errors: {:8} corrected", self.p_corrected);
+        }
+        if self.q_error > 0 {
+            eprintln!("  Q errors: {:8}", self.q_error);
+        }
+        eprintln!();
+    }
+}
+
 fn main() {
     let args: Vec<_> = env::args_os().collect();
     let infile = fs::read(&args[1]).expect("read input");
     assert!(infile.len() % SECTOR_SIZE == 0);
     let mut outfile = BufWriter::new(File::create(&args[2]).expect("open output"));
 
-    let mut pack_count = 0;
-    let mut p_corrected = 0;
-    let mut p_uncorrected = 0;
-    let mut q_error_count = 0;
-
-    let mut zero_count = 0;
-    let mut graphics_count = 0;
-    let mut other_count = 0;
+    let mut all_count = PackCount::new("All");
+    let mut zero_count = PackCount::new("zero");
+    let mut line_graphics_count = PackCount::new("line graphics");
+    let mut cdg_count = PackCount::new("CD+G");
+    let mut cdeg_count = PackCount::new("CD+EG");
+    let mut other_graphics_count = PackCount::new("other graphics");
+    let mut other_count = PackCount::new("other");
 
     for sector in LEADIN_SKIP_SECTORS..(infile.len() / SECTOR_SIZE).saturating_sub(SECTOR_SPREAD) {
         let relative_sector = sector - LEADIN_SKIP_SECTORS;
@@ -66,13 +105,15 @@ fn main() {
         );
 
         for (pack_i, pack) in packet.chunks_mut(PACK_SIZE).enumerate() {
-            pack_count += 1;
+            let mut p_corrected = false;
+            let mut p_uncorrected = false;
+            let mut q_error = false;
 
             if !p_parity::is_correct(pack) {
                 if let Ok(_correct_errors) = p_parity::correct_errors(pack) {
-                    p_corrected += 1;
+                    p_corrected = true;
                 } else {
-                    p_uncorrected += 1;
+                    p_uncorrected = true;
 
                     let mut expected = pack.to_owned();
                     p_parity::encode(&mut expected);
@@ -86,7 +127,7 @@ fn main() {
             // FIXME: I don't know if it's worth trying to fix Q, and if
             // so whether to attempt it before P, or maybe only if P fails.
             if !q_parity::is_correct(&pack[0..4]) {
-                q_error_count += 1;
+                q_error = true;
                 eprintln!(
                     "{time}: Q error {relative_sector:6}.{pack_i}: {tc:08x}",
                     time = format_time(relative_sector),
@@ -94,23 +135,47 @@ fn main() {
                 );
             }
 
-            match pack[0] >> 3 {
-                0 => zero_count += 1,
-                1 => graphics_count += 1,
-                _ => other_count += 1,
+            let pack_type_count = if q_error {
+                &mut other_count
+            } else {
+                match pack[0] >> 3 {
+                    0 => &mut zero_count,
+                    1 => match pack[0] & 0b111 {
+                        0 => &mut line_graphics_count,
+                        1 => &mut cdg_count,
+                        2 => &mut cdeg_count,
+                        _ => &mut other_graphics_count,
+                    },
+                    _ => &mut other_count,
+                }
+            };
+
+            all_count.total += 1;
+            pack_type_count.total += 1;
+            if p_corrected {
+                all_count.p_corrected += 1;
+                pack_type_count.p_corrected += 1;
+            }
+            if p_uncorrected {
+                all_count.p_uncorrected += 1;
+                pack_type_count.p_uncorrected += 1;
+            }
+            if q_error {
+                all_count.q_error += 1;
+                pack_type_count.q_error += 1;
             }
 
             outfile.write_all(pack).expect("write output");
         }
     }
 
-    eprintln!("{pack_count:8} packs");
-    eprintln!("P errors: {p_corrected:8} corrected / {p_uncorrected} uncorrected");
-    eprintln!("Q errors: {q_error_count:8}");
-    eprintln!();
-    eprintln!("{zero_count:8} zero");
-    eprintln!("{graphics_count:8} graphics");
-    eprintln!("{other_count:8} other");
+    all_count.report();
+    zero_count.report();
+    line_graphics_count.report();
+    cdg_count.report();
+    cdeg_count.report();
+    other_graphics_count.report();
+    other_count.report();
 
     outfile.flush().expect("flush output");
 }
