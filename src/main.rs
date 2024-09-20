@@ -104,6 +104,38 @@ impl PackCount {
     }
 }
 
+struct CorrectResult {
+    p_corrected: bool,
+    p_uncorrected: bool,
+    q_error: bool,
+}
+
+fn correct_pack(pack: &mut [u8]) -> CorrectResult {
+    assert_eq!(pack.len(), PACK_SIZE);
+
+    let mut result = CorrectResult {
+        p_corrected: false,
+        p_uncorrected: false,
+        q_error: false,
+    };
+
+    if !p_parity::is_correct(pack) {
+        if let Ok(_correct_errors) = p_parity::correct_errors(pack) {
+            result.p_corrected = true;
+        } else {
+            result.p_uncorrected = true;
+        }
+    }
+
+    // FIXME: I don't know if it's worth trying to fix Q, and if
+    // so whether to attempt it before P, or maybe only if P fails.
+    if !q_parity::is_correct(&pack[0..4]) {
+        result.q_error = true;
+    }
+
+    result
+}
+
 fn main() {
     let args: Vec<_> = env::args_os().collect();
     let infile = fs::read(&args[1]).expect("read input");
@@ -118,37 +150,50 @@ fn main() {
     let mut other_graphics_count = PackCount::new("other graphics");
     let mut other_count = PackCount::new("other");
 
-    for sector in LEADIN_SKIP_SECTORS..(infile.len() / SECTOR_SIZE).saturating_sub(SECTOR_SPREAD) {
+    for sector in 0..infile.len() / SECTOR_SIZE {
+        if sector < LEADIN_SKIP_SECTORS {
+            let relative_sector = (sector as isize) - (LEADIN_SKIP_SECTORS as isize);
+            if sector < SECTOR_SPREAD {
+                if !infile[sector * SECTOR_SIZE..(sector + 1) * SECTOR_SIZE]
+                    .iter()
+                    .all(|b| *b == 0)
+                {
+                    eprintln!("non-zero sector at start of .subcode at {relative_sector}");
+                }
+            } else {
+                // Just check for non-zero packs outside of the TOC range
+                let mut packet = deinterleave_and_mask(
+                    &infile[(sector - SECTOR_SPREAD) * SECTOR_SIZE..(sector + 1) * SECTOR_SIZE],
+                );
+                for (pack_i, pack) in packet.chunks_mut(PACK_SIZE).enumerate() {
+                    let result = correct_pack(pack);
+                    if result.q_error || result.p_uncorrected || (pack[0] >> 3 != 0) {
+                        eprintln!("non-zero pack outside TOC at {relative_sector:6}.{pack_i}");
+                    }
+                }
+            }
+
+            continue;
+        }
+
         let relative_sector = sector - LEADIN_SKIP_SECTORS;
-        // Deinterleave, looking back two sectors for delayed packs
+        // Deinterleave, looking back two sectors for delayed symbols
         let mut packet = deinterleave_and_mask(
             &infile[(sector - SECTOR_SPREAD) * SECTOR_SIZE..(sector + 1) * SECTOR_SIZE],
         );
 
         for (pack_i, pack) in packet.chunks_mut(PACK_SIZE).enumerate() {
-            let mut p_corrected = false;
-            let mut p_uncorrected = false;
-            let mut q_error = false;
-
-            if !p_parity::is_correct(pack) {
-                if let Ok(_correct_errors) = p_parity::correct_errors(pack) {
-                    p_corrected = true;
-                } else {
-                    p_uncorrected = true;
-
-                    let mut expected = pack.to_owned();
-                    p_parity::encode(&mut expected);
-                    eprintln!(
-                        "{time}: P uncorrected {relative_sector:6}.{pack_i}",
-                        time = format_time(relative_sector),
-                    );
-                }
+            let result = correct_pack(pack);
+            if result.p_uncorrected {
+                //let mut expected = pack.to_owned();
+                //p_parity::encode(&mut expected);
+                eprintln!(
+                    "{time}: P uncorrected {relative_sector:6}.{pack_i}",
+                    time = format_time(relative_sector),
+                );
             }
 
-            // FIXME: I don't know if it's worth trying to fix Q, and if
-            // so whether to attempt it before P, or maybe only if P fails.
-            if !q_parity::is_correct(&pack[0..4]) {
-                q_error = true;
+            if result.q_error {
                 eprintln!(
                     "{time}: Q error {relative_sector:6}.{pack_i}: {tc:08x}",
                     time = format_time(relative_sector),
@@ -156,7 +201,7 @@ fn main() {
                 );
             }
 
-            let pack_type_count = if q_error {
+            let pack_type_count = if result.q_error {
                 &mut other_count
             } else {
                 match pack[0] >> 3 {
@@ -173,15 +218,15 @@ fn main() {
 
             all_count.total += 1;
             pack_type_count.total += 1;
-            if p_corrected {
+            if result.p_corrected {
                 all_count.p_corrected += 1;
                 pack_type_count.p_corrected += 1;
             }
-            if p_uncorrected {
+            if result.p_uncorrected {
                 all_count.p_uncorrected += 1;
                 pack_type_count.p_uncorrected += 1;
             }
-            if q_error {
+            if result.q_error {
                 all_count.q_error += 1;
                 pack_type_count.q_error += 1;
             }
@@ -190,6 +235,7 @@ fn main() {
         }
     }
 
+    eprintln!("----");
     all_count.report();
     zero_count.report();
     line_graphics_count.report();
