@@ -14,23 +14,43 @@ mod p_parity {}
 #[rs(gf=gf64, u=u8, block=4, data=2)]
 mod q_parity {}
 
-// deinterleave offsets, from karaoke-dx by way of cdgparse
-const INTERLEAVE_OFFSET: [usize; 24] = [
-    0, 66, 125, 191, 100, 50, 150, 175, 8, 33, 58, 83, 108, 133, 158, 183, 16, 41, 25, 91, 116,
-    141, 166, 75,
-];
-
 const SECTOR_SIZE: usize = 96;
 const PACK_SIZE: usize = 24;
 const SECTOR_SPREAD: usize = 2;
 const LEADIN_SKIP_SECTORS: usize = (10 * 60 + 2) * 75;
 const RW_MASK: u8 = 0x3f;
 
-fn gather_and_mask(buf: &[u8]) -> [u8; SECTOR_SIZE] {
+const fn compute_deinterleave() -> [usize; SECTOR_SIZE] {
+    let mut offsets = [0; SECTOR_SIZE];
+    let mut i = 0;
+
+    while i < SECTOR_SIZE {
+        let pack = i / PACK_SIZE;
+        let col = i % PACK_SIZE;
+        let col = match col {
+            1 => 18,
+            18 => 1,
+
+            2 => 5,
+            5 => 2,
+
+            3 => 23,
+            23 => 3,
+            _ => col,
+        };
+        let lookahead = col % 8;
+        offsets[i] = (pack + lookahead) * PACK_SIZE + col;
+        i += 1;
+    }
+
+    offsets
+}
+
+const DEINTERLEAVE: [usize; SECTOR_SIZE] = compute_deinterleave();
+
+fn deinterleave_and_mask(buf: &[u8]) -> [u8; SECTOR_SIZE] {
     std::array::from_fn(|i| {
-        let packet = i / PACK_SIZE;
-        let column = i % PACK_SIZE;
-        let b = buf[packet * PACK_SIZE + INTERLEAVE_OFFSET[column]];
+        let b = buf[DEINTERLEAVE[i]];
         b & RW_MASK
     })
 }
@@ -100,8 +120,9 @@ fn main() {
 
     for sector in LEADIN_SKIP_SECTORS..(infile.len() / SECTOR_SIZE).saturating_sub(SECTOR_SPREAD) {
         let relative_sector = sector - LEADIN_SKIP_SECTORS;
-        let mut packet = gather_and_mask(
-            &infile[sector * SECTOR_SIZE..(sector + SECTOR_SPREAD + 1) * SECTOR_SIZE],
+        // Deinterleave, looking back two sectors for delayed packs
+        let mut packet = deinterleave_and_mask(
+            &infile[(sector - SECTOR_SPREAD) * SECTOR_SIZE..(sector + 1) * SECTOR_SIZE],
         );
 
         for (pack_i, pack) in packet.chunks_mut(PACK_SIZE).enumerate() {
