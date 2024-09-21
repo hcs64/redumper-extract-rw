@@ -161,7 +161,18 @@ fn parse_end_lba(toc: &[u8]) -> usize {
 
 fn main() -> ExitCode {
     let args: Vec<_> = env::args_os().collect();
-    let image_name = &args[1];
+    let (image_name, out_cdg_name, out_sub_name) = if args.len() == 3 {
+        // exe, in, out.cdg
+        (&args[1], &args[2], None)
+    } else if args.len() == 4 {
+        // exe, in, out.cdg, out.sub
+        (&args[1], &args[2], Some(&args[3]))
+    } else {
+        eprintln!("Usage:");
+        eprintln!("redumper-extract-rw <image-name> <out.cdg> [out.sub]");
+        return ExitCode::FAILURE;
+    };
+
     let mut infile_name = PathBuf::from(image_name);
     infile_name.set_extension("subcode");
     let infile = match fs::read(&infile_name) {
@@ -175,9 +186,7 @@ fn main() -> ExitCode {
     let infile_sectors = infile.len() / SECTOR_SIZE;
     infile_name.set_extension("toc");
     let end_lba = match fs::read(&infile_name) {
-        Ok(infile_toc) => {
-            parse_end_lba(&infile_toc)
-        }
+        Ok(infile_toc) => parse_end_lba(&infile_toc),
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             eprintln!("input .toc not found, using whole .subcode length");
             infile_sectors
@@ -196,7 +205,9 @@ fn main() -> ExitCode {
         end_toc_absolute_sector - LEADIN_SKIP_SECTORS
     );
 
-    let mut outfile = BufWriter::new(File::create(&args[2]).expect("open output"));
+    let mut out_cdg_file = BufWriter::new(File::create(out_cdg_name).expect("open cdg output"));
+    let mut out_sub_file = out_sub_name
+        .map(|out_sub_name| BufWriter::new(File::create(out_sub_name).expect("open sub output")));
 
     let mut all_count = PackCount::new("All");
     let mut zero_count = PackCount::new("zero");
@@ -295,7 +306,25 @@ fn main() -> ExitCode {
                 pack_type_count.q_error += 1;
             }
 
-            outfile.write_all(pack).expect("write output");
+            out_cdg_file.write_all(pack).expect("write cdg output");
+        }
+
+        if let Some(out_sub_file) = &mut out_sub_file {
+            let sector_bytes = &infile[sector * SECTOR_SIZE..(sector + 1) * SECTOR_SIZE];
+            for channel_bit in (0..8).rev() {
+                let out_channel: [u8; SECTOR_SIZE / 8] = std::array::from_fn(|ch_i| {
+                    let mut b_out = 0;
+
+                    for b_i in 0..8 {
+                        let bit = (sector_bytes[ch_i * 8 + b_i] >> channel_bit) & 1;
+                        b_out |= bit << (7 - b_i);
+                    }
+                    b_out
+                });
+                out_sub_file
+                    .write_all(&out_channel)
+                    .expect("write sub output");
+            }
         }
     }
 
@@ -310,6 +339,11 @@ fn main() -> ExitCode {
         }
     }
 
+    out_cdg_file.flush().expect("flush cdg output");
+    if let Some(out_sub_file) = &mut out_sub_file {
+        out_sub_file.flush().expect("flush sub output");
+    }
+
     if !oddity {
         eprintln!("OK!");
     }
@@ -322,8 +356,6 @@ fn main() -> ExitCode {
     cdeg_count.report();
     other_graphics_count.report();
     other_count.report();
-
-    outfile.flush().expect("flush output");
 
     ExitCode::SUCCESS
 }
