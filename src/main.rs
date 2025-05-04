@@ -122,10 +122,12 @@ fn correct_pack(pack: &mut [u8]) -> CorrectResult {
     };
 
     if !p_parity::is_correct(pack) {
+        let original_pack = pack.to_owned();
         if let Ok(_correct_errors) = p_parity::correct_errors(pack) {
             result.p_corrected = true;
         } else {
             result.p_uncorrected = true;
+            pack.copy_from_slice(&original_pack);
         }
     }
 
