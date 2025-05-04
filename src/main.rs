@@ -91,13 +91,15 @@ impl PackCount {
         }
         eprintln!("{} packs:", self.name);
         eprintln!("  total:    {:8}", self.total);
-        if self.p_uncorrected > 0 {
+        if self.p_corrected == 0 && self.p_uncorrected == 0 {
+            eprintln!("  P errors: 0");
+        } else if self.p_uncorrected == 0 {
+            eprintln!("  P errors: {:8} corrected", self.p_corrected);
+        } else {
             eprintln!(
                 "  P errors: {:8} corrected / {} uncorrected",
                 self.p_corrected, self.p_uncorrected
             );
-        } else {
-            eprintln!("  P errors: {:8} corrected", self.p_corrected);
         }
         if self.q_error > 0 {
             eprintln!("  Q errors: {:8}", self.q_error);
