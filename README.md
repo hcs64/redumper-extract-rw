@@ -25,6 +25,8 @@ This will also produce a bitpacked `out.sub` file, not corrected or deinterleave
 
 ## Changelog
 
+* 0.5
+  * keep original pack if P correction fails
 * 0.4
   * report correction count by pack mode
   * delay by 2 sectors to match Cooked RW output
