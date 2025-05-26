@@ -223,17 +223,85 @@ fn parse_end_lba(toc: &[u8]) -> usize {
         .unwrap()
 }
 
+fn write_midi(
+    midi_commands: impl Iterator<Item = (usize, u8, Vec<u8>)>,
+    out_midi_name: String,
+    start_time: usize,
+) {
+    // format MIDI data
+    let mut midi_track: Vec<u8> = vec![];
+
+    let mut last_time = start_time;
+    for command in midi_commands {
+        let delta_time = command.0.checked_sub(last_time).expect("monotonic time");
+        last_time = command.0;
+
+        fn variable_length(mut v: usize) -> Vec<u8> {
+            let mut bs = vec![];
+            loop {
+                let b = u8::try_from(v & 0x7f).unwrap();
+                v >>= 7;
+
+                if bs.is_empty() {
+                    bs.push(b);
+                } else {
+                    bs.push(b | 0x80);
+                }
+
+                if v == 0 {
+                    break;
+                }
+            }
+            bs.reverse();
+            bs
+        }
+
+        midi_track.extend(&variable_length(delta_time * 2usize));
+        midi_track.extend(&[command.1]);
+        midi_track.extend(command.2.as_slice());
+    }
+    let mut out_midi_file = BufWriter::new(File::create(out_midi_name).expect("open MIDI output"));
+
+    // write header
+    let midi_header: Vec<u8> = [
+        b"MThd",
+        // MThd length (6)
+        6u32.to_be_bytes().as_slice(),
+        // format (0)
+        0u16.to_be_bytes().as_slice(),
+        // tracks (1)
+        1u16.to_be_bytes().as_slice(),
+        // division
+        75u16.to_be_bytes().as_slice(),
+        b"MTrk",
+        // MTrk length
+        u32::try_from(midi_track.len())
+            .unwrap()
+            .to_be_bytes()
+            .as_slice(),
+    ]
+    .into_iter()
+    .flatten()
+    .copied()
+    .collect();
+
+    out_midi_file
+        .write_all(&midi_header)
+        .expect("write MIDI header");
+    out_midi_file
+        .write_all(&midi_track)
+        .expect("write MIDI track");
+
+    out_midi_file.flush().expect("flush MIDI output");
+}
 fn main() -> ExitCode {
     let args: Vec<_> = env::args_os().collect();
-    let (image_name, out_cdg_name, out_sub_name) = if args.len() == 3 {
-        // exe, in, out.cdg
-        (&args[1], &args[2], None)
-    } else if args.len() == 4 {
-        // exe, in, out.cdg, out.sub
-        (&args[1], &args[2], Some(&args[3]))
+    let (image_name, midi_out_base_name) = if args.len() == 3 {
+        // exe, in, midi base
+        (&args[1], args[2].to_str().unwrap())
     } else {
         eprintln!("Usage:");
-        eprintln!("redumper-extract-rw <image-name> <out.cdg> [out.sub]");
+        eprintln!("redumper-extract-rw <image-name> <midi-out-base-name>");
         return ExitCode::FAILURE;
     };
 
@@ -269,10 +337,6 @@ fn main() -> ExitCode {
         end_toc_absolute_sector - LEADIN_SKIP_SECTORS
     );
 
-    let mut out_cdg_file = BufWriter::new(File::create(out_cdg_name).expect("open cdg output"));
-    let mut out_sub_file = out_sub_name
-        .map(|out_sub_name| BufWriter::new(File::create(out_sub_name).expect("open sub output")));
-
     let mut all_count = PackCount::new("All");
     let mut zero_count = PackCount::new("zero");
     let mut line_graphics_count = PackCount::new("line graphics");
@@ -292,6 +356,11 @@ fn main() -> ExitCode {
     let mut other_count = PackCount::new("other");
 
     let mut oddity = false;
+
+    let mut midi_commands = vec![];
+    let mut midi_buffer = std::collections::VecDeque::new();
+    let mut midi_start_time = 0;
+    let mut midi_out_count = 1;
 
     eprintln!("----");
 
@@ -378,27 +447,83 @@ fn main() -> ExitCode {
             all_count.add_result(&result);
             pack_type_count.add_result(&result);
 
-            out_cdg_file.write_all(pack).expect("write cdg output");
-        }
+            if !result.q_error && pack[0] == 0o30 {
+                // extract CD+MIDI data
+                midi_buffer.extend(pack[4..20].chunks(4).flat_map(|p| {
+                    [
+                        (p[0] << 2) | (p[1] >> 4),
+                        ((p[1] & 0b1111) << 4) | (p[2] >> 2),
+                        ((p[2] & 0b11) << 6) | p[3],
+                    ]
+                    .into_iter()
+                }));
 
-        if let Some(out_sub_file) = &mut out_sub_file {
-            let sector_bytes = &infile[sector * SECTOR_SIZE..(sector + 1) * SECTOR_SIZE];
-            for channel_bit in (0..8).rev() {
-                let out_channel: [u8; SECTOR_SIZE / 8] = std::array::from_fn(|ch_i| {
-                    let mut b_out = 0;
+                loop {
+                    let Some(command) = midi_buffer.pop_front() else {
+                        break;
+                    };
+                    if command == 0xfa {
+                        eprintln!(
+                            "{time}: MIDI track start {relative_sector:6}.{pack_i}: {tc:08x}",
+                            time = format_time(relative_sector),
+                            tc = u32::from_be_bytes(pack[0..4].try_into().unwrap())
+                        );
 
-                    for b_i in 0..8 {
-                        let bit = (sector_bytes[ch_i * 8 + b_i] >> channel_bit) & 1;
-                        b_out |= bit << (7 - b_i);
+                        midi_start_time = relative_sector;
+                        assert!(midi_commands.is_empty());
                     }
-                    b_out
-                });
-                out_sub_file
-                    .write_all(&out_channel)
-                    .expect("write sub output");
-            }
+                    if command == 0xfc {
+                        eprintln!(
+                            "{time}: MIDI track end {relative_sector:6}.{pack_i}: {tc:08x}",
+                            time = format_time(relative_sector),
+                            tc = u32::from_be_bytes(pack[0..4].try_into().unwrap())
+                        );
+
+                        let out_midi_name = format!("{midi_out_base_name}{midi_out_count}.mid");
+                        // track end meta
+                        midi_commands.push((relative_sector, 0xff, vec![0x2f, 0]));
+                        write_midi(midi_commands.drain(..), out_midi_name, midi_start_time);
+                        midi_out_count += 1;
+                    }
+
+                    let payload_byte_count = match (command, command & 0xf0) {
+                        (0 | 0xfa | 0xf8 | 0xfc, _) => {
+                            continue;
+                        }
+                        (_, 0x80) => {
+                            // note off
+                            2
+                        }
+                        (_, 0x90) => {
+                            // note on
+                            2
+                        }
+                        _ => {
+                            panic!("unexpected command {command:#x}");
+                        }
+                    };
+                    if midi_buffer.len() < payload_byte_count {
+                        // find the payload in the next pack
+                        midi_buffer.push_front(command);
+                        break;
+                    }
+
+                    let payload: Vec<u8> = (0..payload_byte_count)
+                        .map(|_| midi_buffer.pop_front().unwrap())
+                        .collect();
+                    midi_commands.push((relative_sector, command, payload));
+                }
+            } else {
+                // pass
+            };
         }
     }
+    assert_eq!(
+        midi_buffer.len(),
+        0,
+        "MIDI commands should be contained in the TOC"
+    );
+    assert_eq!(midi_commands.len(), 0, "MIDI should end within a track");
 
     for sector in infile_sectors.checked_sub(2).unwrap()..infile_sectors {
         if !infile[sector * SECTOR_SIZE..(sector + 1) * SECTOR_SIZE]
@@ -409,11 +534,6 @@ fn main() -> ExitCode {
             oddity = true;
             eprintln!("non-zero RW in sector at end of .subcode: {relative_sector}");
         }
-    }
-
-    out_cdg_file.flush().expect("flush cdg output");
-    if let Some(out_sub_file) = &mut out_sub_file {
-        out_sub_file.flush().expect("flush sub output");
     }
 
     if !oddity {
