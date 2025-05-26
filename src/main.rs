@@ -69,6 +69,8 @@ fn format_time(sector: usize) -> String {
 struct PackCount {
     total: usize,
     p_corrected: usize,
+    p_corrected_1_symbol: usize,
+    p_corrected_2_symbols: usize,
     p_uncorrected: usize,
     q_error: usize,
     name: String,
@@ -79,9 +81,38 @@ impl PackCount {
         Self {
             total: 0,
             p_corrected: 0,
+            p_corrected_1_symbol: 0,
+            p_corrected_2_symbols: 0,
             p_uncorrected: 0,
             q_error: 0,
             name: name.to_owned(),
+        }
+    }
+
+    fn add_result(&mut self, result: &CorrectResult) {
+        self.total += 1;
+        if result.p_corrected {
+            self.p_corrected += 1;
+            match result.p_error_count {
+                1 => {
+                    self.p_corrected_1_symbol += 1;
+                }
+                2 => {
+                    self.p_corrected_2_symbols += 1;
+                }
+                _ => {
+                    panic!(
+                        "unexpected corrected P errors count {}",
+                        result.p_error_count
+                    );
+                }
+            }
+        }
+        if result.p_uncorrected {
+            self.p_uncorrected += 1;
+        }
+        if result.q_error {
+            self.q_error += 1;
         }
     }
 
@@ -91,14 +122,40 @@ impl PackCount {
         }
         eprintln!("{} packs:", self.name);
         eprintln!("  total:    {:8}", self.total);
+
+        fn format_symbol_counts(pack_count: &PackCount) -> String {
+            let s: String = [
+                ("1x", pack_count.p_corrected_1_symbol),
+                ("2x", pack_count.p_corrected_2_symbols),
+            ]
+            .into_iter()
+            .filter_map(|(symbols, corrected_count)| {
+                (corrected_count != 0).then(|| format!("{symbols}: {corrected_count}"))
+            })
+            .collect::<Vec<String>>()
+            .join(", ");
+
+            if !s.is_empty() {
+                format!(" ({s})")
+            } else {
+                s
+            }
+        }
+
         if self.p_corrected == 0 && self.p_uncorrected == 0 {
-            eprintln!("  P errors: 0");
+            eprintln!("  P errors: {:8}", 0);
         } else if self.p_uncorrected == 0 {
-            eprintln!("  P errors: {:8} corrected", self.p_corrected);
+            eprintln!(
+                "  P errors: {:8} corrected{}",
+                self.p_corrected,
+                format_symbol_counts(self)
+            );
         } else {
             eprintln!(
-                "  P errors: {:8} corrected / {} uncorrected",
-                self.p_corrected, self.p_uncorrected
+                "  P errors: {:8} corrected{} / {} uncorrected",
+                self.p_corrected,
+                format_symbol_counts(self),
+                self.p_uncorrected
             );
         }
         if self.q_error > 0 {
@@ -110,6 +167,7 @@ impl PackCount {
 
 struct CorrectResult {
     p_corrected: bool,
+    p_error_count: usize,
     p_uncorrected: bool,
     q_error: bool,
 }
@@ -119,14 +177,16 @@ fn correct_pack(pack: &mut [u8]) -> CorrectResult {
 
     let mut result = CorrectResult {
         p_corrected: false,
+        p_error_count: 0,
         p_uncorrected: false,
         q_error: false,
     };
 
     if !p_parity::is_correct(pack) {
         let original_pack = pack.to_owned();
-        if let Ok(_correct_errors) = p_parity::correct_errors(pack) {
+        if let Ok(corrected_errors) = p_parity::correct_errors(pack) {
             result.p_corrected = true;
+            result.p_error_count = corrected_errors;
         } else {
             result.p_uncorrected = true;
             pack.copy_from_slice(&original_pack);
@@ -218,7 +278,17 @@ fn main() -> ExitCode {
     let mut line_graphics_count = PackCount::new("line graphics");
     let mut cdg_count = PackCount::new("CD+G");
     let mut cdeg_count = PackCount::new("CD+EG");
-    let mut other_graphics_count = PackCount::new("other graphics");
+    let mut cdmidi_count = PackCount::new("CD+MIDI");
+    let mut user_counts = [
+        PackCount::new("user data"),
+        PackCount::new("user data (item 1)"),
+        PackCount::new("user data (item 2)"),
+        PackCount::new("user data (item 3)"),
+        PackCount::new("user data (item 4)"),
+        PackCount::new("user data (item 5)"),
+        PackCount::new("user data (item 6)"),
+        PackCount::new("user data (item 7)"),
+    ];
     let mut other_count = PackCount::new("other");
 
     let mut oddity = false;
@@ -262,8 +332,9 @@ fn main() -> ExitCode {
         for (pack_i, pack) in packet.chunks_mut(PACK_SIZE).enumerate() {
             let result = correct_pack(pack);
             if result.p_uncorrected {
-                //let mut expected = pack.to_owned();
-                //p_parity::encode(&mut expected);
+                let mut expected = pack.to_owned();
+                p_parity::encode(&mut expected);
+                assert_eq!(pack, &expected);
                 oddity = true;
                 eprintln!(
                     "{time}: P uncorrected {relative_sector:6}.{pack_i}",
@@ -283,32 +354,29 @@ fn main() -> ExitCode {
             let pack_type_count = if result.q_error {
                 &mut other_count
             } else {
-                match pack[0] >> 3 {
-                    0 => &mut zero_count,
-                    1 => match pack[0] & 0b111 {
-                        0 => &mut line_graphics_count,
-                        1 => &mut cdg_count,
-                        2 => &mut cdeg_count,
-                        _ => &mut other_graphics_count,
-                    },
-                    _ => &mut other_count,
+                let mode = pack[0] >> 3;
+                let item = pack[0] & 0b111;
+                match (mode, item) {
+                    (0, 0) => Some(&mut zero_count),
+                    (1, 0) => Some(&mut line_graphics_count),
+                    (1, 1) => Some(&mut cdg_count),
+                    (1, 2) => Some(&mut cdeg_count),
+                    (3, 0) => Some(&mut cdmidi_count),
+                    (7, user_item) => Some(&mut user_counts[usize::from(user_item)]),
+                    _ => None,
                 }
+                .unwrap_or_else(|| {
+                    eprintln!(
+                        "{time}: {pack_type:#02o}",
+                        time = format_time(relative_sector),
+                        pack_type = pack[0]
+                    );
+                    &mut other_count
+                })
             };
 
-            all_count.total += 1;
-            pack_type_count.total += 1;
-            if result.p_corrected {
-                all_count.p_corrected += 1;
-                pack_type_count.p_corrected += 1;
-            }
-            if result.p_uncorrected {
-                all_count.p_uncorrected += 1;
-                pack_type_count.p_uncorrected += 1;
-            }
-            if result.q_error {
-                all_count.q_error += 1;
-                pack_type_count.q_error += 1;
-            }
+            all_count.add_result(&result);
+            pack_type_count.add_result(&result);
 
             out_cdg_file.write_all(pack).expect("write cdg output");
         }
@@ -358,7 +426,10 @@ fn main() -> ExitCode {
     line_graphics_count.report();
     cdg_count.report();
     cdeg_count.report();
-    other_graphics_count.report();
+    cdmidi_count.report();
+    for user_count in user_counts {
+        user_count.report();
+    }
     other_count.report();
 
     ExitCode::SUCCESS
